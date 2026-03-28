@@ -1,20 +1,47 @@
 import os
-import asyncio
 import random
 import sqlite3
 import logging
-from datetime import time, timezone, timedelta
+import threading
+import time
+import urllib.request
+from datetime import timezone, timedelta, date
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
+    Application, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
 )
+from datetime import time as dtime
 
 TOKEN = os.environ["BOT_TOKEN"]
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
-
 MSK = timezone(timedelta(hours=3))
+
 logging.basicConfig(level=logging.INFO)
+
+# ─── Keep-alive ───────────────────────────────────────────────────────────────
+
+class PingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
+
+def run_ping_server():
+    server = HTTPServer(("0.0.0.0", 8080), PingHandler)
+    server.serve_forever()
+
+def keep_alive():
+    url = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8080")
+    while True:
+        try:
+            urllib.request.urlopen(f"{url}/ping")
+        except:
+            pass
+        time.sleep(600)
 
 # ─── База данных ──────────────────────────────────────────────────────────────
 
@@ -45,6 +72,13 @@ def init_db():
             votes_slap   INTEGER DEFAULT 0,
             votes_fuck   INTEGER DEFAULT 0,
             votes_ignore INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS votes (
+            pick_id   INTEGER,
+            user_id   INTEGER,
+            action    TEXT,
+            PRIMARY KEY (pick_id, user_id)
         );
     """)
     conn.commit()
@@ -113,7 +147,7 @@ def pick_next_participant(chat_id: int):
 
     return {"user_id": user_id, "username": username, "first_name": first_name}
 
-# ─── Ежедневный выбор (запускается для всех чатов) ───────────────────────────
+# ─── Ежедневный выбор в 9:00 ─────────────────────────────────────────────────
 
 async def daily_pick_job(context: ContextTypes.DEFAULT_TYPE):
     chat_ids = get_all_chat_ids()
@@ -130,12 +164,12 @@ async def daily_pick_job(context: ContextTypes.DEFAULT_TYPE):
 
         keyboard = InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("💍 Жениться (0)",    callback_data="marry|0"),
+                InlineKeyboardButton("💍 Жениться (0)",     callback_data="marry|0"),
                 InlineKeyboardButton("👋 Дать чапалах (0)", callback_data="slap|0"),
             ],
             [
-                InlineKeyboardButton("🔥 Трахнуть (0)",    callback_data="fuck|0"),
-                InlineKeyboardButton("🙄 Игнор (0)",        callback_data="ignore|0"),
+                InlineKeyboardButton("🔥 Трахнуть (0)",     callback_data="fuck|0"),
+                InlineKeyboardButton("🙄 Игнор (0)",         callback_data="ignore|0"),
             ]
         ])
 
@@ -145,7 +179,6 @@ async def daily_pick_job(context: ContextTypes.DEFAULT_TYPE):
                 text=text,
                 reply_markup=keyboard
             )
-            from datetime import date
             conn = get_conn()
             conn.execute("""
                 INSERT INTO daily_pick (chat_id, user_id, message_id, pick_date)
@@ -156,50 +189,50 @@ async def daily_pick_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Ошибка отправки в чат {chat_id}: {e}")
 
-# ─── Бот добавлен в группу ────────────────────────────────────────────────────
+# ─── Напоминание в 21:00 ─────────────────────────────────────────────────────
 
-async def on_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Срабатывает когда бота добавляют в группу."""
-    for member in update.message.new_chat_members:
-        if member.id == context.bot.id:
-            chat = update.effective_chat
-            register_chat(chat.id, chat.title or "")
-            await update.message.reply_text(
-                "Привет! Я буду каждый день выбирать случайного участника. "
-                "Просто общайтесь — я запомню всех кто пишет в чат."
-            )
-            logging.info(f"Бот добавлен в чат: {chat.title} ({chat.id})")
+async def evening_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    chat_ids = get_all_chat_ids()
 
-# ─── Регистрация участников ───────────────────────────────────────────────────
+    for chat_id in chat_ids:
+        conn = get_conn()
+        c = conn.cursor()
 
-async def track_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Автоматически добавляет в базу всех кто пишет в группу."""
-    user = update.effective_user
-    chat = update.effective_chat
+        # Берём сегодняшний выбор
+        c.execute("""
+            SELECT p.username, p.first_name
+            FROM daily_pick d
+            JOIN participants p ON p.user_id = d.user_id AND p.chat_id = d.chat_id
+            WHERE d.chat_id = ? AND d.pick_date = ?
+            ORDER BY d.id DESC LIMIT 1
+        """, (chat_id, str(date.today())))
+        row = c.fetchone()
+        conn.close()
 
-    if chat.type not in ("group", "supergroup"):
-        return
+        if not row:
+            continue
 
-    # Регистрируем чат на случай если бота добавили до этого события
-    register_chat(chat.id, chat.title or "")
+        username, first_name = row
+        name = f"@{username}" if username else first_name
 
-    conn = get_conn()
-    conn.execute("""
-        INSERT OR IGNORE INTO participants (user_id, chat_id, username, first_name)
-        VALUES (?, ?, ?, ?)
-    """, (user.id, chat.id, user.username, user.first_name))
-    conn.commit()
-    conn.close()
+        text = (
+            f"Ну что, {name}, сегодня мы узнаем насколько тебя любят в чате 👀\n\n"
+            f"Пришли скрин с результатами!"
+        )
+
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        except Exception as e:
+            logging.error(f"Ошибка напоминания в чат {chat_id}: {e}")
 
 # ─── Обработка нажатий кнопок ────────────────────────────────────────────────
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-
-    action, _ = query.data.split("|")
+    user_id = query.from_user.id
     message_id = query.message.message_id
     chat_id = query.message.chat_id
+    action, _ = query.data.split("|")
 
     column_map = {
         "marry": "votes_marry",
@@ -209,39 +242,129 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     col = column_map.get(action)
     if not col:
+        await query.answer()
         return
 
     conn = get_conn()
-    conn.execute(f"""
-        UPDATE daily_pick SET {col} = {col} + 1
+    c = conn.cursor()
+
+    # Находим pick_id для этого сообщения
+    c.execute("""
+        SELECT id FROM daily_pick
         WHERE message_id = ? AND chat_id = ?
     """, (message_id, chat_id))
+    pick_row = c.fetchone()
+
+    if not pick_row:
+        await query.answer()
+        conn.close()
+        return
+
+    pick_id = pick_row[0]
+
+    # Проверяем — голосовал ли уже этот пользователь
+    c.execute("""
+        SELECT action FROM votes
+        WHERE pick_id = ? AND user_id = ?
+    """, (pick_id, user_id))
+    existing = c.fetchone()
+
+    if existing:
+        old_action = existing[0]
+
+        if old_action == action:
+            # Нажал ту же кнопку — ничего не делаем
+            await query.answer("Ты уже выбрал этот вариант", show_alert=False)
+            conn.close()
+            return
+
+        # Нажал другую кнопку — меняем голос
+        old_col = column_map[old_action]
+        conn.execute(f"""
+            UPDATE daily_pick SET {old_col} = MAX(0, {old_col} - 1)
+            WHERE id = ?
+        """, (pick_id,))
+        conn.execute(f"""
+            UPDATE daily_pick SET {col} = {col} + 1
+            WHERE id = ?
+        """, (pick_id,))
+        conn.execute("""
+            UPDATE votes SET action = ?
+            WHERE pick_id = ? AND user_id = ?
+        """, (action, pick_id, user_id))
+
+    else:
+        # Первый голос
+        conn.execute(f"""
+            UPDATE daily_pick SET {col} = {col} + 1
+            WHERE id = ?
+        """, (pick_id,))
+        conn.execute("""
+            INSERT INTO votes (pick_id, user_id, action)
+            VALUES (?, ?, ?)
+        """, (pick_id, user_id, action))
+
     conn.commit()
 
-    c = conn.cursor()
+    # Читаем обновлённые счётчики
     c.execute("""
         SELECT votes_marry, votes_slap, votes_fuck, votes_ignore
-        FROM daily_pick WHERE message_id = ? AND chat_id = ?
-    """, (message_id, chat_id))
+        FROM daily_pick WHERE id = ?
+    """, (pick_id,))
     row = c.fetchone()
     conn.close()
 
     if not row:
+        await query.answer()
         return
 
     vm, vs, vf, vi = row
 
+    # Тихо обновляем кнопки — без сообщения в чат
     new_keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(f"💍 Жениться ({vm})",     callback_data=f"marry|{vm}"),
-            InlineKeyboardButton(f"👋 Дать чапалах ({vs})",  callback_data=f"slap|{vs}"),
+            InlineKeyboardButton(f"👋 Дать чапалах ({vs})", callback_data=f"slap|{vs}"),
         ],
         [
             InlineKeyboardButton(f"🔥 Трахнуть ({vf})",     callback_data=f"fuck|{vf}"),
             InlineKeyboardButton(f"🙄 Игнор ({vi})",         callback_data=f"ignore|{vi}"),
         ]
     ])
+
+    await query.answer()  # убираем "часики" — без текста, тихо
     await query.edit_message_reply_markup(reply_markup=new_keyboard)
+
+# ─── Бот добавлен в группу ───────────────────────────────────────────────────
+
+async def on_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for member in update.message.new_chat_members:
+        if member.id == context.bot.id:
+            chat = update.effective_chat
+            register_chat(chat.id, chat.title or "")
+            await update.message.reply_text(
+                "Привет! Я буду каждый день выбирать случайного участника. "
+                "Просто общайтесь — я запомню всех кто пишет в чат."
+            )
+
+# ─── Регистрация участников ───────────────────────────────────────────────────
+
+async def track_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    register_chat(chat.id, chat.title or "")
+
+    conn = get_conn()
+    conn.execute("""
+        INSERT OR IGNORE INTO participants (user_id, chat_id, username, first_name)
+        VALUES (?, ?, ?, ?)
+    """, (user.id, chat.id, user.username, user.first_name))
+    conn.commit()
+    conn.close()
 
 # ─── Статистика в личных сообщениях ──────────────────────────────────────────
 
@@ -286,24 +409,31 @@ async def private_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     init_db()
+
+    threading.Thread(target=run_ping_server, daemon=True).start()
+    threading.Thread(target=keep_alive, daemon=True).start()
+
     app = Application.builder().token(TOKEN).build()
 
+    # Голосование в 9:00 МСК
     app.job_queue.run_daily(
         daily_pick_job,
-        time=time(hour=9, minute=0, tzinfo=MSK),
+        time=dtime(hour=9, minute=0, tzinfo=MSK),
     )
 
-    # Бота добавили в группу
+    # Напоминание в 21:00 МСК
+    app.job_queue.run_daily(
+        evening_reminder_job,
+        time=dtime(hour=21, minute=0, tzinfo=MSK),
+    )
+
     app.add_handler(MessageHandler(
         filters.StatusUpdate.NEW_CHAT_MEMBERS, on_bot_added
     ))
-    # Любое сообщение в группе — регистрируем участника
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS & filters.TEXT, track_members
     ))
-    # Нажатия кнопок
     app.add_handler(CallbackQueryHandler(button_handler))
-    # Личные сообщения — статистика
     app.add_handler(MessageHandler(
         filters.ChatType.PRIVATE & filters.TEXT, private_stats
     ))
