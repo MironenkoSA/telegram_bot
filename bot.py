@@ -1,6 +1,5 @@
 import os
 import random
-import sqlite3
 import logging
 import threading
 import time
@@ -13,9 +12,11 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes
 )
 from datetime import time as dtime
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 TOKEN = os.environ["BOT_TOKEN"]
-DB_PATH = os.environ.get("DB_PATH", "bot.db")
+DATABASE_URL = os.environ["DATABASE_URL"]
 MSK = timezone(timedelta(hours=3))
 
 logging.basicConfig(level=logging.INFO)
@@ -45,29 +46,33 @@ def keep_alive():
 
 # ─── База данных ──────────────────────────────────────────────────────────────
 
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.executescript("""
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""
         CREATE TABLE IF NOT EXISTS chats (
-            chat_id   INTEGER PRIMARY KEY,
+            chat_id   BIGINT PRIMARY KEY,
             chat_name TEXT
         );
 
         CREATE TABLE IF NOT EXISTS participants (
-            user_id     INTEGER,
-            chat_id     INTEGER,
+            user_id     BIGINT,
+            chat_id     BIGINT,
             username    TEXT,
             first_name  TEXT,
-            is_selected INTEGER DEFAULT 0,
+            is_selected BOOLEAN DEFAULT FALSE,
             PRIMARY KEY (user_id, chat_id)
         );
 
         CREATE TABLE IF NOT EXISTS daily_pick (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id      INTEGER,
-            user_id      INTEGER,
-            message_id   INTEGER,
-            pick_date    TEXT,
+            id           SERIAL PRIMARY KEY,
+            chat_id      BIGINT,
+            user_id      BIGINT,
+            message_id   BIGINT,
+            pick_date    DATE,
             votes_marry  INTEGER DEFAULT 0,
             votes_slap   INTEGER DEFAULT 0,
             votes_fuck   INTEGER DEFAULT 0,
@@ -76,7 +81,7 @@ def init_db():
 
         CREATE TABLE IF NOT EXISTS votes (
             pick_id   INTEGER,
-            user_id   INTEGER,
+            user_id   BIGINT,
             action    TEXT,
             PRIMARY KEY (pick_id, user_id)
         );
@@ -84,16 +89,15 @@ def init_db():
     conn.commit()
     conn.close()
 
-def get_conn():
-    return sqlite3.connect(DB_PATH)
-
 # ─── Регистрация чата ─────────────────────────────────────────────────────────
 
 def register_chat(chat_id: int, chat_name: str):
     conn = get_conn()
-    conn.execute("""
-        INSERT OR IGNORE INTO chats (chat_id, chat_name)
-        VALUES (?, ?)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO chats (chat_id, chat_name)
+        VALUES (%s, %s)
+        ON CONFLICT (chat_id) DO NOTHING
     """, (chat_id, chat_name))
     conn.commit()
     conn.close()
@@ -104,7 +108,7 @@ def get_all_chat_ids() -> list[int]:
     c.execute("SELECT chat_id FROM chats")
     rows = c.fetchall()
     conn.close()
-    return [r[0] for r in rows]
+    return [r["chat_id"] for r in rows]
 
 # ─── Логика выбора без повторений ─────────────────────────────────────────────
 
@@ -115,19 +119,19 @@ def pick_next_participant(chat_id: int):
     c.execute("""
         SELECT user_id, username, first_name
         FROM participants
-        WHERE chat_id = ? AND is_selected = 0
+        WHERE chat_id = %s AND is_selected = FALSE
     """, (chat_id,))
     remaining = c.fetchall()
 
     if not remaining:
-        conn.execute(
-            "UPDATE participants SET is_selected = 0 WHERE chat_id = ?",
+        c.execute(
+            "UPDATE participants SET is_selected = FALSE WHERE chat_id = %s",
             (chat_id,)
         )
         conn.commit()
         c.execute("""
             SELECT user_id, username, first_name
-            FROM participants WHERE chat_id = ?
+            FROM participants WHERE chat_id = %s
         """, (chat_id,))
         remaining = c.fetchall()
 
@@ -136,16 +140,18 @@ def pick_next_participant(chat_id: int):
         return None
 
     chosen = random.choice(remaining)
-    user_id, username, first_name = chosen
-
-    conn.execute("""
-        UPDATE participants SET is_selected = 1
-        WHERE user_id = ? AND chat_id = ?
-    """, (user_id, chat_id))
+    c.execute("""
+        UPDATE participants SET is_selected = TRUE
+        WHERE user_id = %s AND chat_id = %s
+    """, (chosen["user_id"], chat_id))
     conn.commit()
     conn.close()
 
-    return {"user_id": user_id, "username": username, "first_name": first_name}
+    return {
+        "user_id": chosen["user_id"],
+        "username": chosen["username"],
+        "first_name": chosen["first_name"]
+    }
 
 # ─── Ежедневный выбор в 9:00 ─────────────────────────────────────────────────
 
@@ -180,10 +186,11 @@ async def daily_pick_job(context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=keyboard
             )
             conn = get_conn()
-            conn.execute("""
+            c = conn.cursor()
+            c.execute("""
                 INSERT INTO daily_pick (chat_id, user_id, message_id, pick_date)
-                VALUES (?, ?, ?, ?)
-            """, (chat_id, participant['user_id'], msg.message_id, str(date.today())))
+                VALUES (%s, %s, %s, %s)
+            """, (chat_id, participant['user_id'], msg.message_id, date.today()))
             conn.commit()
             conn.close()
         except Exception as e:
@@ -197,24 +204,20 @@ async def evening_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     for chat_id in chat_ids:
         conn = get_conn()
         c = conn.cursor()
-
-        # Берём сегодняшний выбор
         c.execute("""
             SELECT p.username, p.first_name
             FROM daily_pick d
             JOIN participants p ON p.user_id = d.user_id AND p.chat_id = d.chat_id
-            WHERE d.chat_id = ? AND d.pick_date = ?
+            WHERE d.chat_id = %s AND d.pick_date = %s
             ORDER BY d.id DESC LIMIT 1
-        """, (chat_id, str(date.today())))
+        """, (chat_id, date.today()))
         row = c.fetchone()
         conn.close()
 
         if not row:
             continue
 
-        username, first_name = row
-        name = f"@{username}" if username else first_name
-
+        name = f"@{row['username']}" if row['username'] else row['first_name']
         text = (
             f"Ну что, {name}, сегодня мы узнаем насколько тебя любят в чате 👀\n\n"
             f"Пришли скрин с результатами!"
@@ -248,10 +251,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = get_conn()
     c = conn.cursor()
 
-    # Находим pick_id для этого сообщения
     c.execute("""
         SELECT id FROM daily_pick
-        WHERE message_id = ? AND chat_id = ?
+        WHERE message_id = %s AND chat_id = %s
     """, (message_id, chat_id))
     pick_row = c.fetchone()
 
@@ -260,56 +262,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         return
 
-    pick_id = pick_row[0]
+    pick_id = pick_row["id"]
 
-    # Проверяем — голосовал ли уже этот пользователь
     c.execute("""
         SELECT action FROM votes
-        WHERE pick_id = ? AND user_id = ?
+        WHERE pick_id = %s AND user_id = %s
     """, (pick_id, user_id))
     existing = c.fetchone()
 
     if existing:
-        old_action = existing[0]
-
+        old_action = existing["action"]
         if old_action == action:
-            # Нажал ту же кнопку — ничего не делаем
             await query.answer("Ты уже выбрал этот вариант", show_alert=False)
             conn.close()
             return
 
-        # Нажал другую кнопку — меняем голос
         old_col = column_map[old_action]
-        conn.execute(f"""
-            UPDATE daily_pick SET {old_col} = MAX(0, {old_col} - 1)
-            WHERE id = ?
+        c.execute(f"""
+            UPDATE daily_pick
+            SET {old_col} = GREATEST(0, {old_col} - 1),
+                {col} = {col} + 1
+            WHERE id = %s
         """, (pick_id,))
-        conn.execute(f"""
-            UPDATE daily_pick SET {col} = {col} + 1
-            WHERE id = ?
-        """, (pick_id,))
-        conn.execute("""
-            UPDATE votes SET action = ?
-            WHERE pick_id = ? AND user_id = ?
+        c.execute("""
+            UPDATE votes SET action = %s
+            WHERE pick_id = %s AND user_id = %s
         """, (action, pick_id, user_id))
-
     else:
-        # Первый голос
-        conn.execute(f"""
+        c.execute(f"""
             UPDATE daily_pick SET {col} = {col} + 1
-            WHERE id = ?
+            WHERE id = %s
         """, (pick_id,))
-        conn.execute("""
+        c.execute("""
             INSERT INTO votes (pick_id, user_id, action)
-            VALUES (?, ?, ?)
+            VALUES (%s, %s, %s)
         """, (pick_id, user_id, action))
 
     conn.commit()
 
-    # Читаем обновлённые счётчики
     c.execute("""
         SELECT votes_marry, votes_slap, votes_fuck, votes_ignore
-        FROM daily_pick WHERE id = ?
+        FROM daily_pick WHERE id = %s
     """, (pick_id,))
     row = c.fetchone()
     conn.close()
@@ -318,9 +311,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
 
-    vm, vs, vf, vi = row
+    vm = row["votes_marry"]
+    vs = row["votes_slap"]
+    vf = row["votes_fuck"]
+    vi = row["votes_ignore"]
 
-    # Тихо обновляем кнопки — без сообщения в чат
     new_keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton(f"💍 Жениться ({vm})",     callback_data=f"marry|{vm}"),
@@ -332,7 +327,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ])
 
-    await query.answer()  # убираем "часики" — без текста, тихо
+    await query.answer()
     await query.edit_message_reply_markup(reply_markup=new_keyboard)
 
 # ─── Бот добавлен в группу ───────────────────────────────────────────────────
@@ -359,9 +354,11 @@ async def track_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_chat(chat.id, chat.title or "")
 
     conn = get_conn()
-    conn.execute("""
-        INSERT OR IGNORE INTO participants (user_id, chat_id, username, first_name)
-        VALUES (?, ?, ?, ?)
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO participants (user_id, chat_id, username, first_name)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (user_id, chat_id) DO NOTHING
     """, (user.id, chat.id, user.username, user.first_name))
     conn.commit()
     conn.close()
@@ -389,17 +386,16 @@ async def private_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ещё никто не выбран сегодня 🤷")
         return
 
-    name, username, vm, vs, vf, vi, pick_date = row
-    display = f"@{username}" if username else name
-    total = vm + vs + vf + vi
+    display = f"@{row['username']}" if row['username'] else row['first_name']
+    total = row['votes_marry'] + row['votes_slap'] + row['votes_fuck'] + row['votes_ignore']
 
     text = (
-        f"📊 Статистика за {pick_date}\n"
+        f"📊 Статистика за {row['pick_date']}\n"
         f"Участник дня: {display}\n\n"
-        f"💍 Жениться:      {vm}\n"
-        f"👋 Дать чапалах:  {vs}\n"
-        f"🔥 Трахнуть:      {vf}\n"
-        f"🙄 Игнор:         {vi}\n\n"
+        f"💍 Жениться:      {row['votes_marry']}\n"
+        f"👋 Дать чапалах:  {row['votes_slap']}\n"
+        f"🔥 Трахнуть:      {row['votes_fuck']}\n"
+        f"🙄 Игнор:         {row['votes_ignore']}\n\n"
         f"Всего голосов: {total}\n\n"
         f"_Личности голосовавших не сохраняются_"
     )
@@ -415,13 +411,10 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    # Голосование в 9:00 МСК
     app.job_queue.run_daily(
         daily_pick_job,
         time=dtime(hour=9, minute=0, tzinfo=MSK),
     )
-
-    # Напоминание в 21:00 МСК
     app.job_queue.run_daily(
         evening_reminder_job,
         time=dtime(hour=21, minute=0, tzinfo=MSK),
