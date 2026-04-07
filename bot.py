@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 import urllib.request
+import hashlib
 from datetime import timezone, timedelta, date
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,9 +18,16 @@ from psycopg2.extras import RealDictCursor
 
 TOKEN = os.environ["BOT_TOKEN"]
 DATABASE_URL = os.environ["DATABASE_URL"]
+SECRET_SALT = os.environ.get("HASH_SALT", "change_me_please")
 MSK = timezone(timedelta(hours=3))
 
 logging.basicConfig(level=logging.INFO)
+
+# ─── Хэширование user_id ─────────────────────────────────────────────────────
+
+def hash_user_id(user_id: int) -> str:
+    value = f"{SECRET_SALT}:{user_id}"
+    return hashlib.sha256(value.encode()).hexdigest()
 
 # ─── Keep-alive ───────────────────────────────────────────────────────────────
 
@@ -80,10 +88,10 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS votes (
-            pick_id   INTEGER,
-            user_id   BIGINT,
-            action    TEXT,
-            PRIMARY KEY (pick_id, user_id)
+            pick_id     INTEGER,
+            user_hash   TEXT,
+            action      TEXT,
+            PRIMARY KEY (pick_id, user_hash)
         );
     """)
     conn.commit()
@@ -232,7 +240,7 @@ async def evening_reminder_job(context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user_id = query.from_user.id
+    user_hash = hash_user_id(query.from_user.id)
     message_id = query.message.message_id
     chat_id = query.message.chat_id
     action, _ = query.data.split("|")
@@ -264,10 +272,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pick_id = pick_row["id"]
 
+    # Проверяем по хэшу — голосовал ли уже
     c.execute("""
         SELECT action FROM votes
-        WHERE pick_id = %s AND user_id = %s
-    """, (pick_id, user_id))
+        WHERE pick_id = %s AND user_hash = %s
+    """, (pick_id, user_hash))
     existing = c.fetchone()
 
     if existing:
@@ -277,6 +286,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
             return
 
+        # Меняем голос
         old_col = column_map[old_action]
         c.execute(f"""
             UPDATE daily_pick
@@ -286,17 +296,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """, (pick_id,))
         c.execute("""
             UPDATE votes SET action = %s
-            WHERE pick_id = %s AND user_id = %s
-        """, (action, pick_id, user_id))
+            WHERE pick_id = %s AND user_hash = %s
+        """, (action, pick_id, user_hash))
     else:
+        # Первый голос
         c.execute(f"""
             UPDATE daily_pick SET {col} = {col} + 1
             WHERE id = %s
         """, (pick_id,))
         c.execute("""
-            INSERT INTO votes (pick_id, user_id, action)
+            INSERT INTO votes (pick_id, user_hash, action)
             VALUES (%s, %s, %s)
-        """, (pick_id, user_id, action))
+        """, (pick_id, user_hash, action))
 
     conn.commit()
 
