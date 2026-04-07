@@ -380,29 +380,37 @@ async def private_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat.type != "private":
         return
 
+    user_id = update.effective_user.id
+
     conn = get_conn()
     c = conn.cursor()
+
+    # Ищем записи где именно этот пользователь был участником дня
     c.execute("""
         SELECT p.first_name, p.username,
                d.votes_marry, d.votes_slap, d.votes_fuck, d.votes_ignore,
                d.pick_date
         FROM daily_pick d
         JOIN participants p ON p.user_id = d.user_id AND p.chat_id = d.chat_id
+        WHERE d.user_id = %s
         ORDER BY d.id DESC LIMIT 1
-    """)
+    """, (user_id,))
     row = c.fetchone()
     conn.close()
 
     if not row:
-        await update.message.reply_text("Ещё никто не выбран сегодня 🤷")
+        await update.message.reply_text(
+            "Ты ещё ни разу не был участником дня 🤷\n"
+            "Жди своей очереди!"
+        )
         return
 
     display = f"@{row['username']}" if row['username'] else row['first_name']
     total = row['votes_marry'] + row['votes_slap'] + row['votes_fuck'] + row['votes_ignore']
 
     text = (
-        f"📊 Статистика за {row['pick_date']}\n"
-        f"Участник дня: {display}\n\n"
+        f"📊 Твоя последняя статистика\n"
+        f"Дата: {row['pick_date']}\n\n"
         f"💍 Жениться:      {row['votes_marry']}\n"
         f"👋 Дать чапалах:  {row['votes_slap']}\n"
         f"🔥 Трахнуть:      {row['votes_fuck']}\n"
